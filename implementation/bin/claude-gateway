@@ -9,9 +9,23 @@ PID="$RUN/gateway.pid"; LOG="$RUN/gateway.log"; PORT_FILE="$RUN/gateway.port"
 PORT="${CLAUDE_GATEWAY_PORT:-8479}"
 UPSTREAM="${CLAUDE_GATEWAY_UPSTREAM:-mock}"
 UPSTREAM_URL="${CLAUDE_GATEWAY_UPSTREAM_URL:-}"
-# Default URL por upstream (zen -> /inference/v1; resto -> Anthropic)
+API_KEY="${CLAUDE_GATEWAY_API_KEY:-}"
+# Variables de entorno y archivo local opcional (excluido de Git) para credenciales.
+ENV_FILE="$HERE/gateway.env"
+if [ -f "$ENV_FILE" ]; then
+  # shellcheck disable=SC1090
+  set -a; . "$ENV_FILE"; set +a
+fi
+# NVIDIA_API_KEY nunca se hardcodea: se lee del entorno (o de gateway.env local).
+NVIDIA_API_KEY="${NVIDIA_API_KEY:-}"
+export NVIDIA_API_KEY
+# Default URL por upstream (zen -> /inference/v1; nvidia -> NVIDIA NIM)
 if [ -z "$UPSTREAM_URL" ]; then
-  if [ "$UPSTREAM" = "zen" ]; then UPSTREAM_URL="https://opencode.ai/inference/v1"; else UPSTREAM_URL="https://api.anthropic.com"; fi
+  case "$UPSTREAM" in
+    zen)    UPSTREAM_URL="https://opencode.ai/inference/v1" ;;
+    nvidia) UPSTREAM_URL="https://integrate.api.nvidia.com/v1" ;;
+    *)      UPSTREAM_URL="https://api.anthropic.com" ;;
+  esac
 fi
 
 is_up() { [ -f "$PID" ] && kill -0 "$(cat "$PID")" 2>/dev/null; }

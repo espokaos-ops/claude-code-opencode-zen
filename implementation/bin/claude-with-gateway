@@ -3,10 +3,12 @@
 # Child-process env only. Never modifies ~/.claude/settings.json.
 set -u
 PORT="${CLAUDE_GATEWAY_PORT:-8479}"
-# En upstream zen el modelo por defecto es space-bunny-free (relay /messages;
-# muse-spark-* usa el puente Responses interno). Se respeta ANTHROPIC_MODEL si
-# ya viene puesto (p.ej. mock:claude-sonnet en demos).
-if [ "${CLAUDE_GATEWAY_UPSTREAM:-mock}" = "zen" ] && [ -z "${ANTHROPIC_MODEL:-}" ]; then
+# En upstream nvidia el modelo por defecto es NVIDIA_MODEL o
+# nvidia/nemotron-3.5-super-vl-120b-a12b (OpenAI-compatible via NIM). En zen
+# es space-bunny-free. Se respeta ANTHROPIC_MODEL si ya viene puesto.
+if [ "${CLAUDE_GATEWAY_UPSTREAM:-mock}" = "nvidia" ] && [ -z "${ANTHROPIC_MODEL:-}" ]; then
+  MODEL="${NVIDIA_MODEL:-nvidia/nemotron-3.5-super-vl-120b-a12b}"
+elif [ "${CLAUDE_GATEWAY_UPSTREAM:-mock}" = "zen" ] && [ -z "${ANTHROPIC_MODEL:-}" ]; then
   MODEL="space-bunny-free"
 else
   MODEL="${ANTHROPIC_MODEL:-mock:claude-sonnet}"

@@ -159,7 +159,68 @@ Responses y traducción de `tool_use`↔`function_call` + SSE con `call_id` exac
 * `x-opencode-request` solo existe en el wire v1 viejo; el v2 no lo necesita
   (P2b/P4).
 
-## 9. Quickstart: Claude Code + modelo free de Zen vía el gateway (copia-pega)
+## 9. Upstream `nvidia`: Claude Code con modelos de NVIDIA NIM
+
+NVIDIA NIM expone una API **compatible con OpenAI** (`POST /chat/completions`,
+`Authorization: Bearer <NVIDIA_API_KEY>` en
+`https://integrate.api.nvidia.com/v1`), que **no** es el protocolo Anthropic
+que habla Claude Code. Este upstream traduce Messages de Claude Code a NIM y
+devuelve la respuesta en formato Anthropic (SSE, el transporte que espera
+Claude Code), con eco de modelo verificado: si NIM responde otro modelo, el
+gateway devuelve 502 en vez de sustituir en silencio.
+
+Modelo por defecto: `nvidia/nemotron-3.5-super-vl-120b-a12b` (cambiable con
+`NVIDIA_MODEL`). Un unico modelo permitido por instancia de gateway: cualquier
+otro id devuelve 400 `invalid_request_error`.
+
+```sh
+# 0) Variables de entorno (o archivo local gateway.env, excluido de Git via .gitignore).
+export CLAUDE_GATEWAY_UPSTREAM=nvidia
+export NVIDIA_API_KEY="<tu clave de NVIDIA NIM>"   # nunca se guarda en el repo
+export NVIDIA_MODEL=nvidia/nemotron-3.5-super-vl-120b-a12b  # opcional
+
+# 1) Iniciar el gateway local en 127.0.0.1:8479 (upstream NVIDIA NIM).
+cd ~/workspace/Transformers/Claude-Code   # ajusta la ruta si es otra
+./bin/claude-gateway stop 2>/dev/null || true
+./bin/claude-gateway start </dev/null
+curl -s --noproxy '*' http://127.0.0.1:8479/health   # {"status":"ok","upstream":"nvidia",...}
+curl -s --noproxy '*' http://127.0.0.1:8479/v1/models | head -c 200
+
+# 2) Ejecutar Claude Code con el modelo de NVIDIA (solo entorno del hijo).
+export ANTHROPIC_BASE_URL=http://127.0.0.1:8479
+export ANTHROPIC_AUTH_TOKEN=public
+export ANTHROPIC_MODEL=nvidia/nemotron-3.5-super-vl-120b-a12b
+echo "NVIDIA-NIM-MARKER-4242" > /tmp/nim-marker.txt
+claude -p "Lee el archivo /tmp/nim-marker.txt y devuelve su contenido exacto y nada mas" \
+  --output-format json --dangerously-skip-permissions
+# Comprobar: "model":"nvidia/nemotron-3.5-super-vl-120b-a12b" y el texto final
+# contiene NVIDIA-NIM-MARKER-4242.
+
+# 3) Detener el servicio.
+./bin/claude-gateway stop
+```
+
+Equivalente con `bin/claude-with-gateway` (vars solo en el proceso hijo de
+Claude Code; el modelo por defecto es `NVIDIA_MODEL` o el nemotron por defecto):
+
+```sh
+export CLAUDE_GATEWAY_UPSTREAM=nvidia NVIDIA_API_KEY="<tu clave>"
+./bin/claude-with-gateway -p "Lee /tmp/nim-marker.txt y devuelve su contenido"
+```
+
+Limitaciones: cuota del tier free de NVIDIA (429 si se agota; reintentar tras
+una pausa); traduccion a OpenAI-compatible (no es el wire nativo de
+Anthropic); imagenes se envían como `data:` URI cuando el bloque `image` de
+Claude Code las trae.
+
+Nota de ids de modelo: NVIDIA NIM reporta en sus respuestas un id canonico
+interno (observado `private/nvidia/nemotron-3.5-super-120b-a12b` al solicitar
+`nvidia/nemotron-3.5-super-vl-120b-a12b`). El gateway reenvia exactamente el
+modelo solicitado sin sustituirlo: NIM devuelve 200 cuando lo acepta y 400
+cuando no lo reconoce. Por esa diferencia de nombres, el eco de modelo no se
+exige byte a byte para el upstream `nvidia`.
+
+## 10. Quickstart: Claude Code + OpenCode Zen (copia-pega)
 
 Prerrequisitos: Python 3.11+, `claude` (Claude Code 2.1.299) en PATH,
 y el repo en `~/workspace/Transformers/Claude-Code` (o ajustar la ruta).

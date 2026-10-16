@@ -691,5 +691,208 @@ class GatewayZenMessagesCase(unittest.TestCase):
         self.assertIn("truncated", o["error"]["message"])
 
 
+# --------------------------------------------------------------- NVIDIA NIM
+
+class FakeNIMHandler(BaseHTTPRequestHandler):
+    """Servidor NIM minimo en loopback para pruebas del gateway (sin red real)."""
+
+    def log_message(self, *args):  # silencioso
+        pass
+
+    def _send(self, status: int, obj: dict):
+        raw = json.dumps(obj).encode()
+        self.send_response(status)
+        self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(raw)))
+        self.end_headers()
+        try:
+            self.wfile.write(raw)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+    def do_POST(self):
+        length = int(self.headers.get("content-length") or 0)
+        body = json.loads(self.rfile.read(length) or b"{}")
+        self.server.nim_hits.append({
+            "path": self.path,
+            "model": body.get("model"),
+            "stream": body.get("stream"),
+            "tools": bool(body.get("tools")),
+            "tool_choice": body.get("tool_choice"),
+            "auth": self.headers.get("authorization", ""),
+        })
+        mode = getattr(self.server, "nim_mode", "text")
+        if mode == "error":
+            self._send(500, {"error": {"message": "nim boom"}})
+            return
+        model = body.get("model")
+        echoed = "meta/llama-3.1-8b-instruct" if mode == "wrong-model" else model
+        if mode == "tool":
+            message = {"role": "assistant",
+                       "content": "Leo el marcador solicitado.",
+                       "tool_calls": [{"id": "call_nim_1", "type": "function",
+                                       "function": {"name": "read",
+                                                     "arguments": json.dumps(
+                                                         {"filePath": "/tmp/nim-marker.txt"})}}]}
+            finish = "tool_calls"
+        else:
+            message = {"role": "assistant", "content": "respuesta nim de prueba"}
+            finish = "stop"
+        resp = {"id": "cmpl_nim_1", "model": echoed, "created": 1,
+                "choices": [{"index": 0, "message": message,
+                             "finish_reason": finish}],
+                "usage": {"prompt_tokens": 5, "completion_tokens": 7,
+                          "total_tokens": 12}}
+        self._send(200, resp)
+
+
+class TestGatewayNim(unittest.TestCase):
+    """Gateway con upstream nvidia contra un NIM falso en loopback."""
+
+    NIM_MODEL = "nvidia/nemotron-3.5-super-vl-120b-a12b"
+
+    @classmethod
+    def setUpClass(cls):
+        os.environ["NVIDIA_API_KEY"] = "test-nim-key-0000000000000001"
+        os.environ["NVIDIA_MODEL"] = cls.NIM_MODEL
+        cls.nim = ThreadingHTTPServer(("127.0.0.1", 0), FakeNIMHandler)
+        cls.nim.daemon_threads = True
+        cls.nim.nim_mode = "text"
+        cls.nim.nim_hits = []
+        cls.nim_port = cls.nim.server_address[1]
+        cls.nim_base = f"http://127.0.0.1:{cls.nim_port}"
+        cls.nim_thread = threading.Thread(target=cls.nim.serve_forever,
+                                          daemon=True)
+        cls.nim_thread.start()
+        cls.server = build_server(0, "nvidia", cls.nim_base, "")
+        cls.port = cls.server.server_address[1]
+        cls.base = f"http://127.0.0.1:{cls.port}"
+        cls.thread = threading.Thread(target=cls.server.serve_forever,
+                                      daemon=True)
+        cls.thread.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        cls.server.server_close()
+        cls.nim.shutdown()
+        cls.nim.server_close()
+
+    def nim_body(self, text, model=None, tools=None, max_tokens=256,
+                 stream=True):
+        body = {"model": model or self.NIM_MODEL, "max_tokens": max_tokens,
+                "messages": [{"role": "user", "content": text}], "stream": stream}
+        if tools:
+            body["tools"] = tools
+        return body
+
+    def test_health_upstream_nvidia(self):
+        with urllib.request.urlopen(self.base + "/health", timeout=5) as r:
+            obj = json.loads(r.read())
+        self.assertEqual(r.status, 200)
+        self.assertEqual(obj["upstream"], "nvidia")
+
+    def test_models_lista_unico_modelo_nvidia(self):
+        with urllib.request.urlopen(self.base + "/v1/models", timeout=5) as r:
+            obj = json.loads(r.read())
+        ids = [m["id"] for m in obj["data"]]
+        self.assertEqual(ids, [self.NIM_MODEL])
+
+    def test_text_reply_modelo_correcto(self):
+        events = read_sse(self.base, self.nim_body("di hola"))
+        kinds = [e for e, _ in events]
+        self.assertEqual(kinds[0], "message_start")
+        self.assertEqual(kinds[-1], "message_stop")
+        texts = [d["delta"].get("text", "") for e, d in events
+                 if e == "content_block_delta"
+                 and d.get("delta", {}).get("type") == "text_delta"]
+        self.assertIn("respuesta nim de prueba", "".join(texts))
+        stops = [d for e, d in events if e == "message_delta"]
+        self.assertEqual(stops[0]["delta"]["stop_reason"], "end_turn")
+
+    def test_tool_use_traducido(self):
+        self.nim.nim_mode = "tool"
+        try:
+            events = read_sse(self.base, self.nim_body("lee el marcador",
+                                                   tools=[{"name": "read",
+                                                           "input_schema": {
+                                                               "type": "object"}}],
+                                                   stream=True))
+            kinds = [e for e, _ in events]
+            self.assertIn("content_block_start", kinds)
+            starts = [d for e, d in events if e == "content_block_start"
+                      and d.get("content_block", {}).get("type") == "tool_use"]
+            self.assertEqual(len(starts), 1)
+            self.assertEqual(starts[0]["content_block"]["name"], "read")
+            # el input llega completo en los deltas input_json_delta
+            deltas = []
+            for e, d in events:
+                if e == "content_block_delta" and d.get("delta", {}).get(
+                        "type") == "input_json_delta":
+                    deltas.append(d["delta"]["partial_json"])
+            if deltas:
+                blob = json.loads("".join(deltas))
+                self.assertEqual(blob["filePath"], "/tmp/nim-marker.txt")
+            stops = [d for e, d in events if e == "message_delta"]
+            self.assertEqual(stops[0]["delta"]["stop_reason"], "tool_use")
+        finally:
+            self.nim.nim_mode = "text"
+
+    def test_autorizacion_bear_en_peticion(self):
+        read_sse(self.base, self.nim_body("x"))
+        self.assertGreaterEqual(len(self.nim.nim_hits), 1)
+        hit = self.nim.nim_hits[-1]
+        self.assertEqual(hit["path"], "/chat/completions")
+        self.assertFalse(hit["stream"])
+        self.assertTrue(hit["auth"].startswith("Bearer test-nim-key-"),
+                        hit["auth"])
+
+    def test_modelo_desconocido_rechazado_sin_hit_upstream(self):
+        self.nim.nim_hits.clear()
+        s, o = post(self.base, "/v1/messages",
+                    self.nim_body("x", model="claude-sonnet-4"))
+        self.assertEqual(s, 400, o)
+        self.assertEqual(o["error"]["type"], "invalid_request_error")
+        self.assertEqual(len(self.nim.nim_hits), 0)
+
+    def test_eco_de_modelo_no_coincide_no_bloquea_nvidia(self):
+        # NVIDIA NIM reporta ids canonicos internos (p.ej. private/...),
+        # distintos al id solicitado; el gateway reenvia exactamente el
+        # modelo pedido y NIM devuelve 200 (no sustituye silenciosamente).
+        self.nim.nim_mode = "wrong-model"
+        try:
+            events = read_sse(self.base, self.nim_body("x"))
+            kinds = [e for e, _ in events]
+            self.assertEqual(kinds[-1], "message_stop")
+            texts = [d["delta"].get("text", "") for e, d in events
+                     if e == "content_block_delta"
+                     and d.get("delta", {}).get("type") == "text_delta"]
+            self.assertIn("respuesta nim de prueba", "".join(texts))
+        finally:
+            self.nim.nim_mode = "text"
+
+    def test_error_upstream_se_propaga(self):
+        self.nim.nim_mode = "error"
+        try:
+            s, o = read_sse_raw(self.base, self.nim_body("x"))
+        finally:
+            self.nim.nim_mode = "text"
+        self.assertEqual(s, 500)
+
+
+def read_sse_raw(base, obj, timeout=20):
+    """POST stream:true; devuelve (status, cuerpo crudo descodificado)."""
+    data = json.dumps({**obj, "stream": True}).encode()
+    req = urllib.request.Request(base + "/v1/messages", data=data,
+                                 headers={"content-type": "application/json",
+                                          "anthropic-version": "2023-06-01"},
+                                 method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.status, r.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:
+        return e.code, e.read().decode("utf-8", "replace")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

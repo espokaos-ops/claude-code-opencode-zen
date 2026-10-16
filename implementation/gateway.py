@@ -4,8 +4,10 @@
 Speaks Anthropic Messages (POST /v1/messages, optional SSE streaming,
 POST /v1/messages/count_tokens, GET /health, GET /v1/models) and forwards to an
 allowed upstream. Upstreams: ``mock`` (deterministic, no network, for tests),
-``passthrough`` (any Anthropic-compatible base URL with the user's own key) and
-``zen`` (OpenCode free tier, contrato v2 verificado 2026-10-16).
+``passthrough`` (any Anthropic-compatible base URL with the user's own key),
+``zen`` (OpenCode free tier, contrato v2 verificado 2026-10-16) and ``nvidia``
+(NVIDIA NIM, API compatible con OpenAI, traduccion de Messages a
+/chat/completions con eco de modelo verificado).
 
 Upstream ``zen`` tiene dos vias (``zen_fingerprint.py``):
   - Relay fino a ``POST /inference/v1/messages`` (Anthropic nativo): inyecta
@@ -28,6 +30,7 @@ from __future__ import annotations
 import argparse
 import itertools
 import json
+import os
 import re
 import threading
 import time
@@ -42,6 +45,15 @@ ANTHROPIC_VERSION = "2023-06-01"
 from zen_fingerprint import ZEN_INFERENCE_BASE as ZEN_DEFAULT_BASE  # noqa: E402
 ZEN_DEFAULT_MODEL = "space-bunny-free"
 ZEN_MODELS_CACHE_TTL = 600.0
+from nim_wire import (  # noqa: E402
+    DEFAULT_BASE_URL as NIM_DEFAULT_BASE,
+    DEFAULT_MODEL as NIM_DEFAULT_MODEL,
+    anthropic_to_nim,
+    nim_to_anthropic,
+    parse_nim_payload,
+    post_nim,
+)
+NIM_MODELS_CACHE_TTL = 60.0
 
 _msg_counter = itertools.count(1)
 _tool_counter = itertools.count(1)
@@ -342,6 +354,11 @@ class Handler(BaseHTTPRequestHandler):
             data = {"data": models, "object": "list"}
             cfg["models_cache"] = {"data": data, "ts": now}
             return self._send_json(200, data)
+        if cfg["upstream"] == "nvidia":
+            mid = os.environ.get("NVIDIA_MODEL") or NIM_DEFAULT_MODEL
+            return self._send_json(200, {"data": [
+                {"type": "model", "id": mid, "display_name": mid}],
+                "object": "list"})
         self._send_json(404, {"type": "error", "error": {
             "type": "not_found", "message": "models listing not available"}})
 
@@ -368,7 +385,7 @@ class Handler(BaseHTTPRequestHandler):
         # zen: CC 2.1.299 manda role:"system" dentro de messages; el relay lo
         # sanea (hoist_system_messages), asi que aqui se admite.
         problem = validate_messages_request(body,
-                                            allow_system_roles=(cfg["upstream"] == "zen"))
+                                            allow_system_roles=(cfg["upstream"] in ("zen", "nvidia")))
         if problem:
             s, o = error_envelope(400, "invalid_request_error", problem)
             return self._send_json(s, o)
@@ -394,6 +411,9 @@ class Handler(BaseHTTPRequestHandler):
             if is_chat_model(bare):
                 return self._handle_zen_chat(body, stream)
             return self._handle_zen_messages(body, stream)
+
+        if cfg["upstream"] == "nvidia":
+            return self._handle_nvidia(body, stream)
 
         # passthrough: forward bytes unmodified (errors included, unmodified)
         api_key = cfg.get("api_key", "")
@@ -769,6 +789,69 @@ class Handler(BaseHTTPRequestHandler):
             return self._stream_anthropic(msg)
         return self._send_json(200, msg)
 
+    # ---- NVIDIA NIM (API compatible con OpenAI):
+    # Anthropic Messages -> POST /chat/completions -> Mensaje Anthropic (SSE).
+    def _handle_nvidia(self, body: dict, stream: bool):
+        """Traduce peticiones Anthropic Messages a NVIDIA NIM y devuelve el
+        resultado en formato Anthropic (SSE, el transporte que espera Claude
+        Code).
+
+        Un unico modelo permitido (NVIDIA_MODEL, por defecto
+        nvidia/nemotron-3.5-super-vl-120b-a12b): cualquier otro id se rechaza
+        con 400 para no sustituir silenciosamente el modelo pedido.
+        """
+        from freya_wire import normalize_model_id
+
+        expected = os.environ.get("NVIDIA_MODEL") or NIM_DEFAULT_MODEL
+        requested = str(body.get("model") or "")
+        if normalize_model_id(requested) != normalize_model_id(expected):
+            s, o = error_envelope(
+                400, "invalid_request_error",
+                f"modelo no soportado por este gateway (upstream nvidia): "
+                f"{requested or '(ninguno)'}. Modelo configurado: {expected}")
+            return self._send_json(s, o)
+        cfg = self.server.config
+        try:
+            nim_body = anthropic_to_nim(body, expected)
+        except ValueError as e:
+            s, o = error_envelope(400, "invalid_request_error",
+                                  f"traduccion a NVIDIA fallo: {e}")
+            return self._send_json(s, o)
+        api_key = os.environ.get("NVIDIA_API_KEY", "")
+        base_url = cfg.get("upstream_url") or NIM_DEFAULT_BASE
+        try:
+            status, raw, _hdrs = post_nim(nim_body, api_key,
+                                          base_url=base_url, timeout=120)
+        except Exception as e:  # defensive: post_nim no lanza, pero se respalda
+            s, o = error_envelope(502, "api_error",
+                                  f"nvidia upstream failed: {e}")
+            return self._send_json(s, o)
+        if status != 200:
+            try:
+                obj = json.loads(raw.decode("utf-8", "replace") or "{}")
+            except Exception:
+                obj = {"type": "error", "error": {
+                    "type": "api_error",
+                    "message": (raw[:500].decode("utf-8", "replace")
+                                or f"nvidia HTTP {status}")}}
+            if not isinstance(obj, dict) or obj.get("type") != "error":
+                obj = {"type": "error", "error": {
+                    "type": "api_error",
+                    "message": (raw[:500].decode("utf-8", "replace")
+                                or f"nvidia HTTP {status}")}}
+            return self._send_json(status, obj)
+        try:
+            parsed = parse_nim_payload(raw)
+        except Exception as e:
+            s, o = error_envelope(502, "api_error",
+                                  f"nvidia parse failed: {e}")
+            return self._send_json(s, o)
+        mt = body.get("max_tokens")
+        mt = mt if isinstance(mt, int) and mt > 0 else 1024
+        msg = nim_to_anthropic(expected, parsed, max_tokens=mt)
+        # Claude Code espera SSE (text/event-stream); siempre respondemos SSE.
+        return self._stream_anthropic(msg)
+
 
 def build_server(port: int, upstream: str, upstream_url: str, api_key: str
                  ) -> ThreadingHTTPServer:
@@ -786,6 +869,11 @@ def build_server(port: int, upstream: str, upstream_url: str, api_key: str
                 f"default {ZEN_DEFAULT_BASE}")
         if not upstream_url or upstream_url == "https://api.anthropic.com":
             upstream_url = ZEN_DEFAULT_BASE
+    elif upstream == "nvidia":
+        # NVIDIA NIM (OpenAI-compatible): URL libre; por defecto NIM público.
+        # localhost/127.0.0.1 se permiten unicamente para pruebas locales.
+        if not upstream_url or upstream_url == "https://api.anthropic.com":
+            upstream_url = NIM_DEFAULT_BASE
     else:
         if "opencode.ai" in (upstream_url or "").lower():
             raise SystemExit(
@@ -802,12 +890,14 @@ def build_server(port: int, upstream: str, upstream_url: str, api_key: str
 def main() -> None:
     ap = argparse.ArgumentParser(description="Claude-Code local Anthropic gateway")
     ap.add_argument("--port", type=int, default=DEFAULT_PORT)
-    ap.add_argument("--upstream", choices=["mock", "passthrough", "zen"], default="mock")
+    ap.add_argument("--upstream", choices=["mock", "passthrough", "zen", "nvidia"], default="mock")
     ap.add_argument("--upstream-url", default="https://api.anthropic.com")
     ap.add_argument("--api-key", default="")
     args = ap.parse_args()
     if args.upstream == "zen" and args.upstream_url == "https://api.anthropic.com":
         args.upstream_url = ZEN_DEFAULT_BASE
+    if args.upstream == "nvidia" and args.upstream_url == "https://api.anthropic.com":
+        args.upstream_url = NIM_DEFAULT_BASE
     server = build_server(args.port, args.upstream, args.upstream_url, args.api_key)
     print(f"{GATEWAY_NAME} {GATEWAY_VERSION} on 127.0.0.1:"
           f"{server.server_address[1]} upstream={args.upstream}", flush=True)

@@ -1,0 +1,7 @@
+# Credenciales y estado local del gateway (nunca se versionan)
+gateway.env
+.env
+run/
+__pycache__/
+*.pyc
+.env.*.local
