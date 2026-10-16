@@ -1,0 +1,11 @@
+HTTP/1.1 200 Connection established
+
+HTTP/2 403 
+date: Fri, 16 Oct 2026 15:01:53 GMT
+content-type: application/json
+content-length: 175
+cf-placement: remote-IAD
+x-opencode-log-id: 88d568d8-711e-46e5-8090-7b09b8a3cb0d
+server: cloudflare
+cf-ray: a4b7f1026b415f15-EWR
+
