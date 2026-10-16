@@ -1,0 +1,63 @@
+#!/bin/bash
+# claude-gateway: start|stop|status|logs|doctor for the local Anthropic gateway.
+# Loopback only. Never writes ~/.claude/settings.json. Never touches WARP/Privoxy.
+set -u
+HERE="$(cd "$(dirname "$0")/.." && pwd)"
+GATEWAY="$HERE/gateway.py"
+RUN="$HERE/run"; mkdir -p "$RUN"
+PID="$RUN/gateway.pid"; LOG="$RUN/gateway.log"; PORT_FILE="$RUN/gateway.port"
+PORT="${CLAUDE_GATEWAY_PORT:-8479}"
+UPSTREAM="${CLAUDE_GATEWAY_UPSTREAM:-mock}"
+UPSTREAM_URL="${CLAUDE_GATEWAY_UPSTREAM_URL:-}"
+# Default URL por upstream (zen -> /inference/v1; resto -> Anthropic)
+if [ -z "$UPSTREAM_URL" ]; then
+  if [ "$UPSTREAM" = "zen" ]; then UPSTREAM_URL="https://opencode.ai/inference/v1"; else UPSTREAM_URL="https://api.anthropic.com"; fi
+fi
+
+is_up() { [ -f "$PID" ] && kill -0 "$(cat "$PID")" 2>/dev/null; }
+
+cmd_start() {
+  if is_up; then echo "gateway already running pid=$(cat "$PID")"; return 0; fi
+  if ss -tln 2>/dev/null | grep -q "127.0.0.1:$PORT"; then
+    echo "port 127.0.0.1:$PORT occupied (not by this gateway). Set CLAUDE_GATEWAY_PORT." >&2; return 1
+  fi
+  # shellcheck disable=SC2086
+  nohup python3 "$GATEWAY" --port "$PORT" --upstream "$UPSTREAM" \
+    --upstream-url "$UPSTREAM_URL" >>"$LOG" 2>&1 &
+  echo $! > "$PID"; echo "$PORT" > "$PORT_FILE"
+  for i in $(seq 1 25); do
+    sleep 0.2
+    # Loopback never via proxy (Claude Code semantics; ambient HTTP_PROXY may lack NO_PROXY).
+    if curl -s --noproxy '*' --max-time 2 "http://127.0.0.1:$PORT/health" 2>/dev/null | grep -q '"status": "ok"'; then
+      echo "gateway started on 127.0.0.1:$PORT upstream=$UPSTREAM pid=$(cat "$PID")"; return 0
+    fi
+  done
+  echo "gateway failed to become healthy; see $LOG" >&2; return 1
+}
+cmd_stop() {
+  [ -f "$PID" ] || { echo "gateway not running"; return 0; }
+  kill "$(cat "$PID")" 2>/dev/null || true
+  for i in $(seq 1 25); do kill -0 "$(cat "$PID")" 2>/dev/null || break; sleep 0.2; done
+  rm -f "$PID"; echo "gateway stopped"
+}
+cmd_status() {
+  if is_up; then echo "running pid=$(cat "$PID") port=${PORT}";
+    curl -s --noproxy '*' --max-time 5 "http://127.0.0.1:$PORT/health" 2>&1 || echo "health check failed"
+  else echo "stopped"; return 1; fi
+}
+cmd_logs() { tail -n "${1:-50}" "$LOG" 2>/dev/null || echo "(no log yet)"; }
+cmd_doctor() {
+  echo "== doctor =="
+  python3 --version 2>&1
+  claude --version 2>&1 | head -n 1
+  echo -n "warp: "; warp-cli status 2>&1 | tr '\n' ' '
+  echo ""
+  for v in HTTP_PROXY HTTPS_PROXY ALL_PROXY; do eval "echo \"$v=\${$v:-<unset>}\""; done
+  ss -tln 2>/dev/null | grep -E '127.0.0.1:(8118|40000|'"$PORT"')' || true
+  cmd_status || true
+}
+case "${1:-status}" in
+  start) cmd_start;; stop) cmd_stop;; status) cmd_status;;
+  logs) cmd_logs "${2:-50}";; doctor) cmd_doctor;;
+  *) echo "uso: claude-gateway {start|stop|status|logs|doctor}" >&2; exit 2;;
+esac

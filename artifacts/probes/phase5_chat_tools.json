@@ -1,0 +1,82 @@
+[
+ {
+  "model": "space-bunny-free",
+  "status": 200,
+  "bytes": 755,
+  "s": 0.96,
+  "class": "OK_SSE",
+  "text": "OK"
+ },
+ {
+  "model": "beam-free",
+  "status": 200,
+  "bytes": 1490,
+  "s": 0.57,
+  "class": "OK_SSE",
+  "text": "OK"
+ },
+ {
+  "model": "deepseek-v4.1-flash-free",
+  "status": 200,
+  "bytes": 2147,
+  "s": 1.46,
+  "class": "OK_SSE",
+  "text": "OK"
+ },
+ {
+  "model": "glm-5.3-flash-free",
+  "status": 200,
+  "bytes": 1181,
+  "s": 0.98,
+  "class": "OK_SSE",
+  "text": "OK"
+ },
+ {
+  "model": "nemotron-3.5-lightning-free",
+  "status": 200,
+  "bytes": 9480,
+  "s": 0.89,
+  "class": "OK_SSE",
+  "text": "OK"
+ },
+ {
+  "model": "mimo-v2.6-flash-free",
+  "status": 200,
+  "bytes": 1672,
+  "s": 2.33,
+  "class": "OK_SSE",
+  "text": "OK"
+ },
+ {
+  "model": "longcat-2.5-preview-free",
+  "status": 200,
+  "bytes": 2999,
+  "s": 2.46,
+  "class": "OK_SSE",
+  "text": "OK"
+ },
+ {
+  "model": "jev-1.13-free",
+  "status": 400,
+  "bytes": 110,
+  "s": 0.38,
+  "class": "ModelProtocolUnsupported",
+  "err_msg": "Model does not support this protocol."
+ },
+ {
+  "model": "ll-alpha-free",
+  "status": 200,
+  "bytes": 7771,
+  "s": 1.87,
+  "class": "OK_SSE",
+  "text": "OK"
+ },
+ {
+  "model": "nemotron-3.5-super-vl-free",
+  "status": 200,
+  "bytes": 2756,
+  "s": 19.27,
+  "class": "OK_SSE",
+  "text": "OK"
+ }
+]
