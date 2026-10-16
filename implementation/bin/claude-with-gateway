@@ -1,0 +1,19 @@
+#!/bin/bash
+# claude-with-gateway: launch Claude Code pointed at the local gateway.
+# Child-process env only. Never modifies ~/.claude/settings.json.
+set -u
+PORT="${CLAUDE_GATEWAY_PORT:-8479}"
+# En upstream zen el modelo por defecto es space-bunny-free (relay /messages;
+# muse-spark-* usa el puente Responses interno). Se respeta ANTHROPIC_MODEL si
+# ya viene puesto (p.ej. mock:claude-sonnet en demos).
+if [ "${CLAUDE_GATEWAY_UPSTREAM:-mock}" = "zen" ] && [ -z "${ANTHROPIC_MODEL:-}" ]; then
+  MODEL="space-bunny-free"
+else
+  MODEL="${ANTHROPIC_MODEL:-mock:claude-sonnet}"
+fi
+export ANTHROPIC_BASE_URL="http://127.0.0.1:$PORT"
+export ANTHROPIC_AUTH_TOKEN="${ANTHROPIC_AUTH_TOKEN:-dummy-local-gateway}"
+export ANTHROPIC_MODEL="$MODEL"
+unset ANTHROPIC_API_KEY 2>/dev/null || true
+echo "ANTHROPIC_BASE_URL=$ANTHROPIC_BASE_URL ANTHROPIC_MODEL=$ANTHROPIC_MODEL (child env only)"
+exec claude "$@"

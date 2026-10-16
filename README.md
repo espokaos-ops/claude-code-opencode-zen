@@ -2,7 +2,7 @@
 
 Investigación técnica (análisis estático con REA) sobre la viabilidad de usar los **modelos gratuitos de OpenCode Zen** desde **Claude Code 2.1.299**, conservando selector de modelo y funciones habituales.
 
-> **Estado:** investigación y diseño **solamente**. No se ha implementado el adaptador, no se ha modificado Claude Code, no se han hecho pruebas de extremo a extremo contra el proveedor con Claude Code. Dos puntos permanecen **NO DEMOSTRADO** (ver abajo).
+> **Estado (2026-10-16):** investigación completada **y adaptador implementado y verificado de extremo a extremo** con Claude Code 2.1.299 real (marcador `ZEN-E2E-MARKER-4242` con tool `Read`) en las tres familias de protocolo del free tier. Código en `implementation/`; evidencia nueva en `artifacts/probes/phase5_*` y `artifacts/reports/PHASE5-MATRIX.md`. Los dos pendientes históricos quedaron **DEMOSTRADO** (ver «Estado real»).
 
 ---
 
@@ -28,12 +28,27 @@ Determinar si Claude Code puede hablar con Zen (modelos gratuitos) y de qué for
 
 ## Estado real (honesto)
 
-- **Ruta A:** los mecanismos están demostrados en código, pero **NO DEMOSTRADO** que funcione de extremo a extremo:
-  - **Pendiente 1 — herramientas capitalizadas:** Claude Code envía `Bash`, `Read`, `Edit`…; la puerta se demostró con nombres minúsculos. Sensibilidad a mayúsculas de la condición 3: desconocida.
-  - **Pendiente 2 — comportamiento real en el cable:** 2.1.299 nunca se ha ejecutado contra Zen. Que emita IDs arbitrarios solo está demostrado estáticamente (`mZe()`).
-  - Además: aceptación por-modelo de la superficie unificada (solo `space-bunny-free` demostrado), y comportamiento de `count_tokens`/`cache_touch`.
-- **Ruta B:** diseño completo; **no implementada, no probada**. No se afirma que funcione.
-- **Restricciones respetadas en toda la investigación:** sin peticiones de prueba al proveedor (salvo las capturas previas documentadas), sin instalar nada, sin modificar Claude Code ni configs del sistema.
+- **Implementación (`implementation/`, gateway 0.4.0):** `DEMOSTRADO`. Relay
+  `/messages` + bridges `/responses` y `/chat/completions`, fingerprint v2
+  (tools `read`/`shell` verbatim), routing por modelo, guard de truncamiento.
+  Suite 66/66.
+- **E2E Claude Code real:** `DEMOSTRADO` con `ZEN-E2E-MARKER-4242` y tool `Read`
+  en `space-bunny-free` (messages), `muse-spark-*` (Fase 4) y `big-pickle`
+  (responses), `beam-free` y `deepseek-v4.1-flash-free` (chat).
+- **Pendiente 1 (herramientas capitalizadas):** resuelto — la puerta v2 exige
+  `read`/`shell` verbatim ADICIONALES; las tools capitalizadas de CC conviven
+  (DEMOSTRADO en vivo).
+- **Pendiente 2 (cable real de 2.1.299):** resuelto — E2E real ejecutado; CC
+  emite warning `unrecognized_model` para ids free desconocidos (inofensivo).
+- **Descubrimiento Fase 5:** el catálogo free se reparte en 3 protocolos
+  (matriz completa en `artifacts/reports/PHASE5-MATRIX.md`); `jev-1.13-free`
+  no acepta ninguno (NO DEMOSTRADO/inerte).
+- **Multimodal:** `DEMOSTRADO` por `/messages` (el modelo ve la imagen); por
+  chat `image_url` → 422/400 (NO DEMOSTRADO; el bridge omite imágenes).
+- **`count_tokens` upstream:** 404 (no existe); el gateway sirve estimador
+  local y CC funciona (DEMOSTRADO).
+- **Restricciones respetadas:** sin modificar Claude Code, configs del sistema,
+  WARP/Privoxy; logs sin secretos; errores del proveedor sin transformar.
 
 Leyenda de clasificación: `DEMOSTRADO` (evidencia directa: código o captura) · `DOCUMENTADO` (documentación oficial) · `INFERIDO` (derivado razonado) · `NO DEMOSTRADO` (pendiente de verificación empírica).
 
@@ -51,7 +66,15 @@ Leyenda de clasificación: `DEMOSTRADO` (evidencia directa: código o captura) �
     ├── reports/               ← informes originales (evidencia narrativa)
     ├── code-excerpts/         ← extractos verbatim del código analizado
     ├── catalogs/              ← catálogos de modelos (binario OpenCode + models.dev)
-    └── probes/                ← respuestas HTTP 403 FreeTierError (sondas anonimizadas)
+    └── probes/                ← sondas HTTP (403 históricas) + evidencia Fase 5
+├── implementation/            ← adaptador funcional (gateway 0.4.0 + tests + docs)
+│   ├── gateway.py             ← servidor loopback (routing 3 protocolos)
+│   ├── zen_fingerprint.py     ← contrato v2 + normalizador SSE + routing
+│   ├── zen_bridge.py          ← Anthropic ↔ Responses (muse, big-pickle)
+│   ├── zen_chat.py            ← Anthropic ↔ chat/completions (resto de free)
+│   ├── freya_wire.py / freya_tools.py
+│   ├── bin/                   ← claude-gateway / claude-with-gateway
+│   └── tests/                 ← 66 tests stdlib (unittest)
 ```
 
 ## Recomendación de modelo (separada de los hechos)
