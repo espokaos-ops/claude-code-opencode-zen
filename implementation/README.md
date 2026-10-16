@@ -257,4 +257,43 @@ Diagnóstico rápido:
 * `502` / `event: error`: el upstream respondió un modelo distinto al pedido (el gateway no sustituye silenciosamente).
 * `429`: cuota free agotada; esperar y reintentar.
 
+## 11. Uso persistente: `claude` con NVIDIA NIM por defecto
+
+Para que ejecutar simplemente `claude` use siempre el modelo NVIDIA verificado a
+través del gateway local en `127.0.0.1:8479`, sin reconfigurar en cada sesión:
+
+```sh
+# 0) Una sola vez: crear ~/.claude/gateway.env (no se versiona, chmod 600).
+#    La clave NVIDIA_API_KEY se toma de tu almacén de OpenCode y nunca se imprime
+#    ni se guarda en el repositorio.
+KEY=$(python3 -c "import json;print(json.load(open('/home/kaos/.local/share/opencode/auth.json'))['nvidia']['key'])")
+cat > ~/.claude/gateway.env <<EOF
+CLAUDE_GATEWAY_UPSTREAM=nvidia
+CLAUDE_GATEWAY_PORT=8479
+NVIDIA_API_KEY=$KEY
+NVIDIA_MODEL=nvidia/nemotron-3.5-super-vl-120b-a12b
+NVIDIA_BASE_URL=https://integrate.api.nvidia.com/v1
+EOF
+chmod 600 ~/.claude/gateway.env
+
+# 1) Ejecutar claude (el wrapper arranca el gateway automaticamente si no esta arriba).
+claude -p "tu consulta" --dangerously-skip-permissions
+
+# El wrapper exporta automaticamente:
+#   ANTHROPIC_BASE_URL=http://127.0.0.1:8479
+#   ANTHROPIC_AUTH_TOKEN=public
+#   ANTHROPIC_MODEL=nvidia/nemotron-3.5-super-vl-120b-a12b
+# y lanza el binario real de Claude Code (~/.local/bin/claude.real).
+
+# 2) Detener el gateway cuando termine (opcional; el proximo `claude` lo vuelve a arrancar).
+~/.local/bin/claude.real  # no se usa directamente; usar `claude`
+/home/kaos/workspace/Transformers/Claude-Code/bin/claude-gateway stop
+```
+
+Notas:
+* El binario original de Claude Code se guardo como `~/.local/bin/claude.real`; `~/.local/bin/claude` es ahora el wrapper que gestiona el gateway. Es reversible: borrar el wrapper y restaurar el symlink original.
+* La configuracion global de Claude Code (`~/.claude/settings.json`) no se modifica; solo tiene `"theme": "dark"`.
+* OpenCode y el modo Zen del gateway no se modifican: Zen sigue disponible con `CLAUDE_GATEWAY_UPSTREAM=zen ./bin/claude-gateway start` en el puerto 8479 (el wrapper de `claude` reiniciaria el gateway como nvidia si lo encuentra en otro upstream).
+* Limitacion: el gateway es un proceso de usuario (nohup). Si se reinicia la maquina, no arranca solo hasta que se ejecute `claude` de nuevo, momento en el que el wrapper lo levanta bajo demanda.
+
 Nota: `bin/claude-with-gateway` ya define `ANTHROPIC_MODEL=space-bunny-free` cuando el upstream es `zen`; basta con ejecutarlo con `ANTHROPIC_BASE_URL=http://127.0.0.1:8479 ANTHROPIC_AUTH_TOKEN=public`.

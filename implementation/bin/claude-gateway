@@ -12,10 +12,13 @@ UPSTREAM_URL="${CLAUDE_GATEWAY_UPSTREAM_URL:-}"
 API_KEY="${CLAUDE_GATEWAY_API_KEY:-}"
 # Variables de entorno y archivo local opcional (excluido de Git) para credenciales.
 ENV_FILE="$HERE/gateway.env"
-if [ -f "$ENV_FILE" ]; then
-  # shellcheck disable=SC1090
-  set -a; . "$ENV_FILE"; set +a
-fi
+USER_ENV_FILE="$HOME/.claude/gateway.env"
+for ENV_FILE in "$HERE/gateway.env" "$USER_ENV_FILE"; do
+  if [ -f "$ENV_FILE" ]; then
+    # shellcheck disable=SC1090
+    set -a; . "$ENV_FILE"; set +a
+  fi
+done
 # NVIDIA_API_KEY nunca se hardcodea: se lee del entorno (o de gateway.env local).
 NVIDIA_API_KEY="${NVIDIA_API_KEY:-}"
 export NVIDIA_API_KEY
