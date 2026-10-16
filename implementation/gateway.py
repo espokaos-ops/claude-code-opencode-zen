@@ -207,6 +207,22 @@ def error_envelope(http_status: int, err_type: str, message: str) -> tuple[int, 
     return http_status, {"type": "error", "error": {"type": err_type, "message": message}}
 
 
+def model_echo_error(expected: str, echoed: str) -> dict | None:
+    """Error si el upstream reporta otro modelo que el solicitado.
+
+    Verifica que el modelo pedido sea el que realmente responde (eco del campo
+    ``model``); un eco ausente no se puede verificar y no falla.
+    """
+    from freya_wire import normalize_model_id
+    seen = normalize_model_id(echoed)
+    if seen and expected and seen != normalize_model_id(expected):
+        return {"type": "error", "error": {
+            "type": "api_error",
+            "message": f"upstream answered model '{echoed}' for requested "
+                       f"model '{expected}'"}}
+    return None
+
+
 # ------------------------------------------------------------- passthrough
 
 def passthrough(base_url: str, api_key: str, body: dict, stream: bool,
@@ -286,6 +302,7 @@ class Handler(BaseHTTPRequestHandler):
                 {"type": "model", "id": "mock:claude-sonnet",
                  "display_name": "mock:claude-sonnet"}], "object": "list"})
         if cfg["upstream"] == "zen":
+            from freya_wire import OPENCODE_FREE_MODELS, model_alias, resolve_zen_model
             from zen_fingerprint import fetch_models
             cache = cfg.setdefault("models_cache", {})
             now = time.time()
@@ -298,15 +315,30 @@ class Handler(BaseHTTPRequestHandler):
                 s, o = error_envelope(502, "api_error",
                                       f"zen models fetch failed (HTTP {status})")
                 return self._send_json(s, o)
+            # Solo los free verificados, servidos como alias de selector
+            # (claude-free-<id>): asi el selector de CC los muestra y el
+            # gateway los vuelve a mapear al slug real. Los ids de pago no se
+            # anuncian porque el wire publico los rechaza.
+            catalog = obj.get("data") if isinstance(obj.get("data"), list) else obj.get("models") or []
             models = []
-            for m in obj.get("data") if isinstance(obj.get("data"), list) else obj.get("models") or []:
-                if isinstance(m, dict) and m.get("id"):
-                    entry = {"type": "model", "id": str(m["id"])}
-                    if m.get("name"):
-                        entry["display_name"] = str(m["name"])
-                    models.append(entry)
-                elif isinstance(m, str):
-                    models.append({"type": "model", "id": m})
+            seen: set[str] = set()
+            for m in catalog:
+                mid = str(m.get("id") if isinstance(m, dict) else m or "")
+                if not mid:
+                    continue
+                try:
+                    bare = resolve_zen_model(mid)
+                except ValueError:
+                    continue
+                if bare in seen:
+                    continue
+                seen.add(bare)
+                models.append({"type": "model", "id": model_alias(bare),
+                               "display_name": bare})
+            if not models:
+                models = [{"type": "model", "id": model_alias(bare),
+                           "display_name": bare}
+                          for bare in sorted(OPENCODE_FREE_MODELS)]
             data = {"data": models, "object": "list"}
             cfg["models_cache"] = {"data": data, "ts": now}
             return self._send_json(200, data)
@@ -349,8 +381,14 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_json(status, obj)
 
         if cfg["upstream"] == "zen":
+            from freya_wire import resolve_zen_model
             from zen_fingerprint import is_chat_model, is_responses_model
-            bare = str(body.get("model") or "").rsplit("/", 1)[-1]
+            try:
+                body["model"] = resolve_zen_model(body.get("model"))
+            except ValueError as e:
+                s, o = error_envelope(400, "invalid_request_error", str(e))
+                return self._send_json(s, o)
+            bare = body["model"]
             if is_responses_model(bare):
                 return self._handle_zen_responses(body, stream)
             if is_chat_model(bare):
@@ -493,9 +531,10 @@ class Handler(BaseHTTPRequestHandler):
         if status != 200:
             return self._send_zen_error(status, obj)
         resp = obj
+        expected = str(patched.get("model") or "")
         try:
             if stream:
-                return self._relay_anthropic_stream(resp, amap)
+                return self._relay_anthropic_stream(resp, amap, expected)
             raw = resp.read()
             chunks: list[bytes] = []
             norm = AnthropicSSENormalizer(alias_map=amap)
@@ -505,6 +544,15 @@ class Handler(BaseHTTPRequestHandler):
             msg = assemble_message(chunks)
             if "_error" in msg:
                 return self._send_json(502, msg["_error"])
+            if not norm.saw_message_stop:
+                return self._send_json(502, {
+                    "type": "error", "error": {
+                        "type": "api_error",
+                        "message": "upstream stream ended before message_stop "
+                                   "(truncated by provider)"}})
+            mismatch = model_echo_error(expected, norm.model_name or msg.get("model", ""))
+            if mismatch:
+                return self._send_json(502, mismatch)
             return self._send_json(200, msg)
         finally:
             try:
@@ -525,12 +573,13 @@ class Handler(BaseHTTPRequestHandler):
                                               "message": json.dumps(obj)[:500]}}
         return self._send_json(status, obj)
 
-    def _relay_anthropic_stream(self, resp, amap: dict):
+    def _relay_anthropic_stream(self, resp, amap: dict, expected_model: str = ""):
         """Reenvia el SSE de Zen normalizando frames placeholder.
 
         Si el upstream cierra sin ``message_stop`` (corte a mitad de stream,
-        observado en el free tier), se emite un ``event: error`` para que el
-        cliente reintente en vez de quedar esperando para siempre.
+        observado en el free tier) o el eco de modelo no coincide, se emite un
+        ``event: error`` para que el cliente reintente en vez de aceptar una
+        respuesta incompleta o de otro modelo.
         """
         from zen_fingerprint import AnthropicSSENormalizer
         self.close_connection = True
@@ -560,6 +609,14 @@ class Handler(BaseHTTPRequestHandler):
                     + json.dumps(err, separators=(",", ":")).encode()
                     + b"\n\n"
                 )
+            else:
+                mismatch = model_echo_error(expected_model, norm.model_name)
+                if mismatch:
+                    self.wfile.write(
+                        b"event: error\ndata: "
+                        + json.dumps(mismatch, separators=(",", ":")).encode()
+                        + b"\n\n"
+                    )
             self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError):
             pass
@@ -579,7 +636,7 @@ class Handler(BaseHTTPRequestHandler):
                                   f"zen bridge unavailable: {e}")
             return self._send_json(s, o)
         try:
-            rbody, scope = anthropic_to_responses_body(body)
+            rbody, scope, amap = anthropic_to_responses_body(body)
         except Exception as e:
             s, o = error_envelope(400, "invalid_request_error",
                                   f"zen translation failed: {e}")
@@ -613,11 +670,24 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send_json(502, err)
             s, o = error_envelope(502, "api_error", str(err)[:500])
             return self._send_json(s, o)
+        mismatch = model_echo_error(str(body.get("model") or ""),
+                                    str(parsed.get("model_name") or ""))
+        if mismatch:
+            return self._send_json(502, mismatch)
+        if not parsed.get("saw_done"):
+            err = {"type": "error", "error": {
+                "type": "api_error",
+                "message": "upstream stream ended before response.completed "
+                           "(truncated by provider)"}}
+            if stream:
+                return self._stream_error_event(err)
+            return self._send_json(502, err)
         model = str(body.get("model") or ZEN_DEFAULT_MODEL)
         try:
             mt = body.get("max_tokens")
             mt = mt if isinstance(mt, int) and mt > 0 else 1024
-            msg = responses_to_anthropic(model, parsed, max_tokens=mt)
+            msg = responses_to_anthropic(model, parsed, max_tokens=mt,
+                                         alias_map=amap)
         except Exception as e:
             s, o = error_envelope(502, "api_error",
                                   f"zen to-anthropic failed: {e}")
@@ -639,7 +709,7 @@ class Handler(BaseHTTPRequestHandler):
                                   f"zen chat bridge unavailable: {e}")
             return self._send_json(s, o)
         try:
-            cbody, scope = anthropic_to_chat_body(body)
+            cbody, scope, amap = anthropic_to_chat_body(body)
         except Exception as e:
             s, o = error_envelope(400, "invalid_request_error",
                                   f"zen translation failed: {e}")
@@ -679,11 +749,18 @@ class Handler(BaseHTTPRequestHandler):
             if stream:
                 return self._stream_error_event(err)
             return self._send_json(502, err)
+        mismatch = model_echo_error(str(body.get("model") or ""),
+                                    str(parsed.get("model_name") or ""))
+        if mismatch:
+            if stream:
+                return self._stream_error_event(mismatch)
+            return self._send_json(502, mismatch)
         model = str(body.get("model") or ZEN_DEFAULT_MODEL)
         try:
             mt = body.get("max_tokens")
             mt = mt if isinstance(mt, int) and mt > 0 else 1024
-            msg = chat_to_anthropic(model, parsed, max_tokens=mt)
+            msg = chat_to_anthropic(model, parsed, max_tokens=mt,
+                                    alias_map=amap)
         except Exception as e:
             s, o = error_envelope(502, "api_error",
                                   f"zen to-anthropic failed: {e}")

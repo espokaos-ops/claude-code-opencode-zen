@@ -24,6 +24,7 @@ urllib.request.install_opener(urllib.request.build_opener(urllib.request.ProxyHa
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from gateway import build_server  # noqa: E402  (same directory, not Hermes)
+import freya_wire  # noqa: E402
 import zen_fingerprint  # noqa: E402
 
 
@@ -44,7 +45,8 @@ def post(base, path, obj, headers=None, timeout=15):
             return e.code, {"raw": raw[:200].decode("utf-8", "replace")}
 
 
-def read_sse(base, obj, timeout=20, max_events=400):
+def read_sse(base, obj, timeout=20, max_events=400,
+             stop_at_message_stop=True):
     """POST with stream:true, return list of (event, data)."""
     data = json.dumps({**obj, "stream": True}).encode()
     req = urllib.request.Request(base + "/v1/messages", data=data,
@@ -72,7 +74,7 @@ def read_sse(base, obj, timeout=20, max_events=400):
                     events.append((ev, json.loads(payload)))
                 except Exception:
                     pass
-                if ev == "message_stop":
+                if stop_at_message_stop and ev == "message_stop":
                     return events
     return events
 
@@ -227,8 +229,8 @@ class FakeZenMessagesHandler(BaseHTTPRequestHandler):
             "type": "FreeTierError", "message": why}}).encode())
 
     def do_GET(self):
-        models = {"data": [{"id": "fake-model-one", "name": "Fake One"},
-                           {"id": "fake-model-two"}]}
+        models = {"data": [{"id": "beam-free", "name": "Beam"},
+                           {"id": "paid-model-not-free"}]}
         self._send(200, json.dumps(models).encode())
 
     def do_POST(self):
@@ -242,7 +244,23 @@ class FakeZenMessagesHandler(BaseHTTPRequestHandler):
             "headers": dict(self.headers), "body": body, "path": self.path}
 
         if self.path.rstrip("/").endswith("/responses"):
-            resp = {"id": "resp_fake1", "output": [
+            req_model = str(body.get("model") or "")
+            if body.get("max_output_tokens") == 76:
+                resp = {"id": "resp_fake2", "model": "wrong-model-free",
+                        "output": [{"type": "message", "role": "assistant",
+                                    "content": [{"type": "output_text",
+                                                 "text": "hola"}]}],
+                        "usage": {"input_tokens": 1, "output_tokens": 1}}
+                return self._send(200, json.dumps(resp).encode())
+            if body.get("max_output_tokens") == 75:
+                trunc = (
+                    'event: response.created\n'
+                    'data: {"type":"response.created","response":'
+                    '{"id":"resp_trunc","model":"muse-spark-1.3-contributor-free",'
+                    '"output":[]}}\n\n'
+                ).encode()
+                return self._send(200, trunc, "text/event-stream")
+            resp = {"id": "resp_fake1", "model": req_model, "output": [
                 {"type": "message", "role": "assistant",
                  "content": [{"type": "output_text", "text": "hola muse"}]},
                 {"type": "function_call", "name": "read", "call_id": "call_fake1",
@@ -284,6 +302,16 @@ class FakeZenMessagesHandler(BaseHTTPRequestHandler):
             if body.get("max_tokens") == 78:
                 return self._send(403, json.dumps({"type": "error", "error": {
                     "type": "FreeTierError", "message": "forced chat"}}).encode())
+            if body.get("max_tokens") == 76:
+                wrong = (
+                    'data: {"id":"chatcmpl_wrong","choices":[{"index":0,'
+                    '"delta":{"role":"assistant"}}],"model":"wrong-model-free"}\n\n'
+                    'data: {"id":"chatcmpl_wrong","choices":[{"index":0,'
+                    '"delta":{"content":"hola"},"finish_reason":"stop"}],'
+                    '"model":"wrong-model-free"}\n\n'
+                    "data: [DONE]\n\n"
+                ).encode()
+                return self._send(200, wrong, "text/event-stream")
             if body.get("max_tokens") == 77:
                 trunc = (
                     'data: {"id":"chatcmpl_trunc","choices":[{"index":0,'
@@ -313,7 +341,29 @@ class FakeZenMessagesHandler(BaseHTTPRequestHandler):
                 '{"prompt_tokens":13,"completion_tokens":7,"total_tokens":20}}\n\n'
                 "data: [DONE]\n\n"
             ).encode()
+            cm = str(body.get("model") or "beam-free")
+            chat_sse = chat_sse.replace(b'"model":"beam-free"',
+                                        b'"model":"' + cm.encode() + b'"')
             return self._send(200, chat_sse, "text/event-stream")
+
+        if body.get("max_tokens") == 76:
+            wrong = (
+                "event: message_start\n"
+                'data: {"type":"message_start","message":{"id":"msg_wrong","type":"message",'
+                '"role":"assistant","model":"wrong-model-free","content":[],'
+                '"usage":{"input_tokens":1}}}\n\n'
+                "event: content_block_start\n"
+                'data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\n'
+                "event: content_block_delta\n"
+                'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hola"}}\n\n'
+                "event: content_block_stop\n"
+                'data: {"type":"content_block_stop","index":0}\n\n'
+                "event: message_delta\n"
+                'data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}\n\n'
+                "event: message_stop\n"
+                'data: {"type":"message_stop"}\n\n'
+            ).encode()
+            return self._send(200, wrong, "text/event-stream")
 
         tools = {t.get("name"): t for t in body.get("tools") or []
                  if isinstance(t, dict)}
@@ -451,7 +501,8 @@ class GatewayZenMessagesCase(unittest.TestCase):
         self.assertEqual(o["usage"]["output_tokens"], 9)
 
     def test_muse_path_streams_well_formed_sse(self):
-        events = read_sse(self.base, self.cc_body(model="muse-spark-free"))
+        events = read_sse(self.base,
+                          self.cc_body(model="muse-spark-1.3-contributor-free"))
         self.assertEqual(events[0][0], "message_start")
         self.assertIsNone(events[0][1]["message"].get("stop_reason"))
         starts = [d for e, d in events if e == "content_block_start"]
@@ -558,9 +609,86 @@ class GatewayZenMessagesCase(unittest.TestCase):
     def test_models_endpoint(self):
         with urllib.request.urlopen(self.base + "/v1/models", timeout=5) as r:
             data = json.loads(r.read())
-        ids = [m["id"] for m in data["data"]]
-        self.assertEqual(ids, ["fake-model-one", "fake-model-two"])
-        self.assertEqual(data["data"][0]["display_name"], "Fake One")
+        # solo free verificados, como alias de selector para Claude Code
+        self.assertEqual([m["id"] for m in data["data"]], ["claude-free-beam-free"])
+        self.assertEqual(data["data"][0]["display_name"], "beam-free")
+
+    def test_unknown_model_rejected_without_substitution(self):
+        before = FakeZenMessagesHandler.last_request
+        s, o = post(self.base, "/v1/messages",
+                    self.cc_body(model="claude-sonnet-4-5"))
+        self.assertEqual(s, 400)
+        self.assertEqual(o["error"]["type"], "invalid_request_error")
+        self.assertIn("free models", o["error"]["message"])
+        # ningun request llego al upstream (no hay sustitucion silenciosa)
+        self.assertIs(FakeZenMessagesHandler.last_request, before)
+
+    def test_all_free_models_resolve(self):
+        for mid in sorted(freya_wire.OPENCODE_FREE_MODELS):
+            self.assertEqual(freya_wire.resolve_zen_model(mid), mid)
+            self.assertEqual(freya_wire.resolve_zen_model("claude-free-" + mid), mid)
+        self.assertEqual(len(freya_wire.OPENCODE_FREE_MODELS), 13)
+
+    def test_selector_alias_routes_to_real_model(self):
+        body = self.cc_body(model="claude-free-beam-free")
+        s, o = post(self.base, "/v1/messages", body)
+        self.assertEqual(s, 200)
+        last = FakeZenMessagesHandler.last_request
+        self.assertTrue(last["path"].rstrip("/").endswith("/chat/completions"))
+        self.assertEqual(last["body"]["model"], "beam-free")
+
+    def test_big_pickle_routes_to_chat_and_preserves_model(self):
+        body = self.cc_body(model="big-pickle")
+        s, o = post(self.base, "/v1/messages", body)
+        self.assertEqual(s, 200, o)
+        last = FakeZenMessagesHandler.last_request
+        self.assertTrue(last["path"].rstrip("/").endswith("/chat/completions"))
+        self.assertEqual(last["body"]["model"], "big-pickle")
+        self.assertEqual(o["model"], "big-pickle")
+
+    def test_chat_model_echo_mismatch_errors(self):
+        events = read_sse(self.base, self.cc_body(model="beam-free",
+                                                  max_tokens=76))
+        errs = [d for e, d in events if e == "error"]
+        self.assertEqual(len(errs), 1)
+        self.assertIn("answered model 'wrong-model-free'",
+                      errs[0]["error"]["message"])
+
+    def test_relay_stream_echo_mismatch_appends_error(self):
+        events = read_sse(self.base, self.cc_body(model="space-bunny-free",
+                                                  max_tokens=76),
+                          stop_at_message_stop=False)
+        self.assertTrue(any(e == "message_stop" for e, _ in events))
+        errs = [d for e, d in events if e == "error"]
+        self.assertEqual(len(errs), 1)
+        self.assertIn("answered model 'wrong-model-free'",
+                      errs[0]["error"]["message"])
+
+    def test_relay_nonstream_truncated_is_502(self):
+        s, o = post(self.base, "/v1/messages",
+                    self.cc_body(model="space-bunny-free", max_tokens=77))
+        self.assertEqual(s, 502)
+        self.assertIn("truncated", o["error"]["message"])
+
+    def test_relay_nonstream_echo_mismatch_is_502(self):
+        s, o = post(self.base, "/v1/messages",
+                    self.cc_body(model="space-bunny-free", max_tokens=76))
+        self.assertEqual(s, 502)
+        self.assertIn("answered model 'wrong-model-free'", o["error"]["message"])
+
+    def test_responses_echo_mismatch_is_502(self):
+        s, o = post(self.base, "/v1/messages",
+                    self.cc_body(model="muse-spark-1.3-contributor-free",
+                                 max_tokens=76))
+        self.assertEqual(s, 502)
+        self.assertIn("answered model 'wrong-model-free'", o["error"]["message"])
+
+    def test_responses_truncated_is_502(self):
+        s, o = post(self.base, "/v1/messages",
+                    self.cc_body(model="muse-spark-1.3-contributor-free",
+                                 max_tokens=75))
+        self.assertEqual(s, 502)
+        self.assertIn("truncated", o["error"]["message"])
 
 
 if __name__ == "__main__":

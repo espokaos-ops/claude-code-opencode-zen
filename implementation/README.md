@@ -101,41 +101,99 @@ Responses y traducción de `tool_use`↔`function_call` + SSE con `call_id` exac
 ## 7. Fases 4–5 (2026-10-16): gateway 0.4.0 operativo contra Zen free
 
 * `DEMOSTRADO`: wire v2 aceptado en vivo (`/inference/v1/messages`, UA
-  `opencode/latest/2.0.26/cli`, `Bearer public`, sesion `ses_...` fresca,
-  tools `read`/`shell` verbatim obligatorias en `/messages` y `/chat/completions`;
-  `stream:true` obligatorio). Ver `zen_fingerprint.py` (sin Hermes).
-* `DEMOSTRADO`: matriz de protocolos por modelo (Fase 5):
-  * `/messages` → `space-bunny-free` (unico verificado);
-  * `/responses` → `muse-spark-1.2/1.3-contributor-free` y `big-pickle`;
+  `opencode/latest/2.0.26/cli`, `Bearer public`, sesión `ses_...` fresca,
+  tools `read`/`shell` verbatim obligatorias en `/messages` y
+  `/chat/completions`; `stream:true` obligatorio). Ver `zen_fingerprint.py`
+  (sin Hermes).
+* `DEMOSTRADO`: matriz de protocolos por modelo (Fase 5 + re-verificación
+  2026-10-16):
+  * `/messages` → `space-bunny-free` (único verificado en esta vía).
+  * `/responses` → `muse-spark-1.2-contributor-free` y
+    `muse-spark-1.3-contributor-free`. Nota: `muse-spark-1.3-contributor-free`
+    respondió 200 en `/responses` (Fase 5 y sonda directa), pero hoy el free
+    tier devuelve 429 en esta ruta; reintentar más tarde.
   * `/chat/completions` → `beam-free`, `deepseek-v4.1-flash-free`,
     `glm-5.3-flash-free`, `nemotron-3.5-lightning-free`,
     `nemotron-3.5-super-vl-free`, `mimo-v2.6-flash-free`,
-    `longcat-2.5-preview-free`, `ll-alpha-free` (+`space-bunny-free`);
-  * `jev-1.13-free`: 400 `ModelProtocolUnsupported` en los tres (inutilizable).
-  Routing automatico en el gateway: `is_responses_model` / `is_chat_model`
+    `longcat-2.5-preview-free`, `ll-alpha-free` (+`space-bunny-free`),
+    **y `big-pickle`** (en Fase 5 midió 200 en `/responses`, pero hoy responde
+    en `/chat/completions` y rechaza `/responses` con 400 `ModelProtocolUnsupported`;
+    el routing del gateway se actualizó en consecuencia).
+  * `jev-1.13-free`: 400 `ModelProtocolUnsupported` en las tres (inutilizable).
+  Routing automático en el gateway: `is_responses_model` / `is_chat_model`
   (`zen_fingerprint.py`), bridges `zen_bridge.py` y `zen_chat.py` (nuevo).
-* `DEMOSTRADO`: E2E real Claude Code 2.1.299 con marcador `ZEN-E2E-MARKER-4242`
-  (tool Read + respuesta final): space-bunny-free (messages), muse-spark
-  (responses, Fase 4), beam-free y deepseek-v4.1-flash-free (chat),
-  big-pickle (responses). Evidencia en `artifacts/probes/` del repo (Fase 4: logs E2E; Fase 5:
-  `phase5_cc_*.json`).
+* `DEMOSTRADO` (E2E Claude Code 2.1.299 con marcador `ZEN-E2E-MARKER-4242`,
+  tool Read + respuesta final; modelo solicitado = modelo que respondió, eco
+  verificado por el gateway): `space-bunny-free` (messages) y `beam-free`
+  (chat). Evidencia en `/tmp/opencode/probes/` (`phase4_*`,
+  `phase5_cc_*.json`, `p6_*`).
+* `DEMOSTRADO` a nivel HTTP a través del gateway (eco verificado por el propio
+  gateway, HTTP 200): `deepseek-v4.1-flash-free` (chat), `big-pickle`
+  (chat). E2E completo de Claude Code con estos dos y con
+  `muse-spark-1.3-contributor-free` (responses) queda pendiente por agotarse
+  la cuota free hoy (ver §9 para el comando exacto).
 * `DEMOSTRADO`: multimodal por `/messages` (bloque `image` base64: el modelo
   la ve; `phase5_img_messages.sse`). Por chat `image_url`: 422/400 → el bridge
-  descarta imagenes (limitacion).
+  deja una nota visible (`IMAGE_OMITTED_NOTE`) en vez de descartar en silencio.
 * `DEMOSTRADO`: `count_tokens` no existe upstream (404); el gateway sirve su
   estimador local (`len//4`) y CC funciona sin el endpoint real.
 * `DEMOSTRADO`: guard de truncamiento (upstream corta sin `message_stop`/
-  `[DONE]` → `event: error` para que CC reintente en vez de colgar 300 s),
-  `_stream_anthropic` corregido (sin duplicar input/texto), `connection: close`.
-* `DEMOSTRADO`: suite **66/66 OK** (`test_gateway.py`, `test_fingerprint.py`,
+  `[DONE]` → `event: error` para que CC reintente en vez de colgar), `_stream_anthropic`
+  corregido (sin duplicar input/texto), `connection: close`.
+* `DEMOSTRADO`: resolución estricta de modelo (sin sustitución silenciosa:
+  modelo desconocido → 400 `invalid_request_error` con la lista de free);
+  guard de eco de modelo: mismatch → 502 (no-stream) / `event: error` (stream).
+* `DEMOSTRADO`: suite **82/82 OK** (`test_gateway.py`, `test_fingerprint.py`,
   `test_zen_bridge.py`, `test_zen_chat.py`).
 
 ## 8. Limites actuales (NO DEMOSTRADO / DOCUMENTADO)
 
 * `jev-1.13-free` listado pero sin protocolo que lo acepte (NO DEMOSTRADO).
-* Imagenes en la via chat (bridge las omite; upstream 422/400) y tool
-  roundtrip de los chat restantes (ll-alpha, mimo, longcat, glm, nemotron):
+* Imagenes en la vía chat (bridge deja nota visible; upstream 422/400) y tool
+  roundtrip de los chats restantes (ll-alpha, mimo, longcat, glm, nemotron):
   NO DEMOSTRADO.
-* Rate limits/429 del free tier: DOCUMENTADO por el proveedor, no agotado en
-  pruebas. `x-opencode-request` solo existe en el wire v1 viejo; el v2 no lo
-  necesita (P2b/P4).
+* Rate limit/429 del free tier: observable hoy (2026-10-16) en varias rutas;
+  DOCUMENTADO por el proveedor, reintentar tras pausa.
+* `claude` emite `[claude-code:unrecognized_model]` con algunos ids: inofensivo,
+  no bloquea.
+* `x-opencode-request` solo existe en el wire v1 viejo; el v2 no lo necesita
+  (P2b/P4).
+
+## 9. Quickstart: Claude Code + modelo free de Zen vía el gateway (copia-pega)
+
+Prerrequisitos: Python 3.11+, `claude` (Claude Code 2.1.299) en PATH,
+y el repo en `~/workspace/Transformers/Claude-Code` (o ajustar la ruta).
+
+```sh
+# 0) variables de entorno del gateway (una sola vez)
+export CLAUDE_GATEWAY_UPSTREAM=zen
+export REPO=~/workspace/Transformers/Claude-Code
+
+# 1) iniciar el gateway local en 127.0.0.1:8479 (upstream Zen)
+cd "$REPO"
+./bin/claude-gateway stop 2>/dev/null || true
+./bin/claude-gateway start </dev/null
+curl -s --noproxy '*' http://127.0.0.1:8479/health   # {"status":"ok","upstream":"zen",...}
+curl -s --noproxy '*' http://127.0.0.1:8479/v1/models | head -c 400   # lista modelos free
+
+# 2) ejecutar Claude Code con un modelo free (ejemplo: beam-free, vía /chat/completions)
+export ANTHROPIC_BASE_URL=http://127.0.0.1:8479
+export ANTHROPIC_AUTH_TOKEN=public
+export ANTHROPIC_MODEL=beam-free            # alias equivalente: claude-free-beam-free
+echo "ZEN-E2E-MARKER-4242" > /tmp/zen-marker.txt
+claude -p "Usa la herramienta Read para leer /tmp/zen-marker.txt y devuelve su contenido exacto y nada más" \
+  --output-format json --dangerously-skip-permissions
+# Comprobar: "model":"beam-free" y el texto final contiene ZEN-E2E-MARKER-4242
+# (otra opción válida: ANTHROPIC_MODEL=big-pickle, que el gateway rota a /chat/completions)
+
+# 3) detener el gateway cuando termine
+./bin/claude-gateway stop
+```
+
+Diagnóstico rápido:
+* `403 FreeTierError`: el provider exige huella de cliente real; el gateway lo propaga sin modificar (no es configuración local).
+* `400 invalid_request_error`: modelo no está en la lista free (`/v1/models`).
+* `502` / `event: error`: el upstream respondió un modelo distinto al pedido (el gateway no sustituye silenciosamente).
+* `429`: cuota free agotada; esperar y reintentar.
+
+Nota: `bin/claude-with-gateway` ya define `ANTHROPIC_MODEL=space-bunny-free` cuando el upstream es `zen`; basta con ejecutarlo con `ANTHROPIC_BASE_URL=http://127.0.0.1:8479 ANTHROPIC_AUTH_TOKEN=public`.

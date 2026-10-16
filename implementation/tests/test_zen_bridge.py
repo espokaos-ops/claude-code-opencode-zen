@@ -86,9 +86,17 @@ class WireCase(unittest.TestCase):
         self.assertEqual(freya_wire.zen_model_for_request(
             "opencode-zen/muse-spark-1.3-contributor-free"),
             "muse-spark-1.3-contributor-free")
-        # Modelo no-free -> default Muse Spark Free (activacion documentada)
-        self.assertEqual(freya_wire.zen_model_for_request("mock:claude-sonnet"),
-                         "muse-spark-1.3-contributor-free")
+        self.assertEqual(freya_wire.zen_model_for_request(
+            "claude-free-muse-spark-1.3-contributor-free"),
+            "muse-spark-1.3-contributor-free")
+        self.assertEqual(freya_wire.zen_model_for_request("claude-free-beam-free"),
+                         "beam-free")
+        # big-pickle es free y debe conservarse (no sustituirse por muse)
+        self.assertEqual(freya_wire.zen_model_for_request("big-pickle"),
+                         "big-pickle")
+        # Modelo no-free -> error explicito (nunca sustitucion silenciosa)
+        with self.assertRaises(ValueError):
+            freya_wire.zen_model_for_request("mock:claude-sonnet")
 
     def test_headers_shape(self):
         h = freya_wire.free_wire_headers("unit-scope-headers")
@@ -169,7 +177,8 @@ class BridgeCase(unittest.TestCase):
         body = {"model": "muse-spark-1.3-contributor-free", "max_tokens": 64,
                 "system": "sys", "messages": [{"role": "user", "content": "hi"}],
                 "tools": []}
-        rbody, scope = zen_bridge.anthropic_to_responses_body(body)
+        rbody, scope, amap = zen_bridge.anthropic_to_responses_body(body)
+        self.assertEqual(amap, {})
         self.assertEqual(rbody["model"], "muse-spark-1.3-contributor-free")
         self.assertTrue(rbody["stream"])
         self.assertFalse(rbody["store"])
@@ -199,9 +208,28 @@ class BridgeCase(unittest.TestCase):
         ).encode()
         parsed = zen_bridge.parse_responses_payload(sse, "text/event-stream")
         self.assertIn("hola", parsed["text"])
+        self.assertTrue(parsed["saw_done"])
         self.assertTrue(any(c["name"] == "read" for c in parsed["tool_calls"]))
         call = next(c for c in parsed["tool_calls"] if c["name"] == "read")
         self.assertEqual(call["arguments"]["filePath"], "/tmp/a")
+
+    def test_parse_without_completed_not_done(self):
+        sse = ('event: response.output_text.delta\n'
+               'data: {"type":"response.output_text.delta","delta":"cor"}\n\n'
+               ).encode()
+        parsed = zen_bridge.parse_responses_payload(sse, "text/event-stream")
+        self.assertFalse(parsed["saw_done"])
+
+    def test_alias_restored_in_responses_to_anthropic(self):
+        parsed = {"text": "", "tool_calls": [
+            {"id": "c1", "name": "read_client", "arguments": {"pattern": "x"}}],
+            "usage": {}, "response_id": "r1"}
+        msg = zen_bridge.responses_to_anthropic(
+            "muse-spark-1.3-contributor-free", parsed,
+            alias_map={"read_client": "read"})
+        tool = msg["content"][0]
+        self.assertEqual(tool["name"], "read")
+        self.assertEqual(tool["input"], {"pattern": "x"})
 
     def test_responses_to_anthropic(self):
         parsed = {"text": "listo MARKER-ZEN-1",

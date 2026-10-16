@@ -468,7 +468,7 @@ def apply_fingerprint_tools(body: dict, style: str = "anthropic") -> dict[str, s
 
 
 RESPONSES_MODEL_PREFIXES = ("muse-spark",)
-RESPONSES_MODELS = {"big-pickle"}  # 400 en /messages, 200 en /responses (Fase 5)
+RESPONSES_MODELS = set()  # big-pickle pasó a /chat/completions (verificado 2026-10-16)
 MESSAGES_MODELS = {"space-bunny-free"}  # unico con /messages 200 verificado (P2/P4)
 
 
@@ -477,7 +477,7 @@ def bare_model_id(model: Any) -> str:
 
 
 def is_responses_model(model: Any) -> bool:
-    """muse-spark* y big-pickle viven solo en /responses (400 en /messages)."""
+    """muse-spark* viven solo en /responses (400 en /messages y /chat)."""
     bare = bare_model_id(model)
     return bare in RESPONSES_MODELS or bare.startswith(RESPONSES_MODEL_PREFIXES)
 
@@ -688,6 +688,7 @@ class AnthropicSSENormalizer:
         self._buf: dict[int, dict[str, Any]] = {}
         self._lines: list[bytes] = []
         self.saw_message_stop = False
+        self.model_name = ""  # modelo que reporta el upstream (eco verificado)
 
     # -- API por lineas (streaming)
     def feed_line(self, raw: bytes) -> list[bytes]:
@@ -713,6 +714,11 @@ class AnthropicSSENormalizer:
         if not isinstance(data, dict):
             return [frame]  # no-JSON: pasa crudo
         etype = str(data.get("type") or event)
+        if etype == "message_start":
+            msg = data.get("message") if isinstance(data.get("message"), dict) else {}
+            name = str(msg.get("model") or "").strip()
+            if name and not self.model_name:
+                self.model_name = name
         if etype == "content_block_start":
             return self._on_start(data)
         if etype == "content_block_delta":

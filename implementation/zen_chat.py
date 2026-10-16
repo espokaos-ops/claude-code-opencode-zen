@@ -14,7 +14,7 @@ import urllib.error
 import urllib.request
 from typing import Any
 
-from freya_wire import conversation_scope, zen_model_for_request
+from freya_wire import conversation_scope, resolve_zen_model
 from zen_bridge import estimate_tokens, flatten_anthropic_system
 from zen_fingerprint import (
     PLACEHOLDER_CLIENT_NAMES,
@@ -26,6 +26,13 @@ from zen_fingerprint import (
 )
 
 ZEN_CHAT_PATH = "/chat/completions"
+
+# El bridge chat no envia imagenes al upstream (422/400 observados). En vez de
+# descartarlas en silencio, se inserta una nota visible para el modelo.
+IMAGE_OMITTED_NOTE = (
+    "[image omitted: this free model is served via the chat.completions "
+    "bridge, which does not accept image input; use space-bunny-free "
+    "(/messages relay) for images]")
 
 
 # ------------------------------------------------------- Anthropic -> chat
@@ -63,6 +70,8 @@ def _tool_result_text(block: dict) -> str:
         for b in content:
             if isinstance(b, dict) and b.get("type") == "text":
                 bits.append(str(b.get("text", "")))
+            elif isinstance(b, dict) and b.get("type") in ("image", "document"):
+                bits.append(IMAGE_OMITTED_NOTE)
             elif isinstance(b, str):
                 bits.append(b)
     return "\n".join(bits)
@@ -121,8 +130,10 @@ def anthropic_messages_to_chat(messages: Any) -> list[dict[str, Any]]:
                                       "content": _tool_result_text(b) or "(no output)"})
                 elif bt == "text":
                     text_bits.append(str(b.get("text", "")))
-                # image/document: el chat free-tier no acepta bloques multimodales
-                # (NO DEMOSTRADO); se omiten del wire chat.
+                elif bt in ("image", "document"):
+                    # Nota visible (no se descarta en silencio): el modelo debe
+                    # saber que hay una imagen que este bridge no puede enviar.
+                    text_bits.append(IMAGE_OMITTED_NOTE)
         out.extend(tool_msgs)
         text = "\n".join(x for x in text_bits if x)
         if text:
@@ -130,13 +141,13 @@ def anthropic_messages_to_chat(messages: Any) -> list[dict[str, Any]]:
     return out
 
 
-def anthropic_to_chat_body(body: dict) -> tuple[dict[str, Any], str]:
-    """Body chat.completions + scope. Fingerprint v2 estilo chat."""
+def anthropic_to_chat_body(body: dict) -> tuple[dict[str, Any], str, dict[str, str]]:
+    """Body chat.completions + scope + mapa alias->nombre original."""
     if not isinstance(body, dict):
         raise ValueError("body must be an object")
     hoist_system_messages(body)
     scope = conversation_scope(body)
-    model = zen_model_for_request(body.get("model"))
+    model = resolve_zen_model(body.get("model"))
     system = flatten_anthropic_system(body.get("system"))
     messages: list[dict[str, Any]] = []
     if system.strip():
@@ -154,8 +165,8 @@ def anthropic_to_chat_body(body: dict) -> tuple[dict[str, Any], str]:
     cbody["max_tokens"] = mt if isinstance(mt, int) and mt > 0 else 1024
     # Fingerprint v2 chat: alias de colisiones, read/shell verbatim, nota
     # anti-placeholder y tool_choice nunca "none" (apply_fingerprint_tools).
-    apply_fingerprint_tools(cbody, style="chat")
-    return cbody, scope
+    amap = apply_fingerprint_tools(cbody, style="chat")
+    return cbody, scope, amap
 
 
 # ------------------------------------------------------- parse Zen chat SSE
@@ -195,7 +206,7 @@ def parse_chat_payload(raw: bytes, content_type: str = "") -> dict[str, Any]:
     finish_reason} de SSE o JSON directo (error incluido)."""
     result: dict[str, Any] = {"text": "", "tool_calls": [], "usage": {},
                               "response_id": "", "finish_reason": "",
-                              "saw_done": False}
+                              "saw_done": False, "model_name": ""}
     if not raw:
         return result
     if raw.strip()[:1] in (b"{", b"["):
@@ -235,6 +246,8 @@ def parse_chat_payload(raw: bytes, content_type: str = "") -> dict[str, Any]:
             continue
         if obj.get("id") and not result["response_id"]:
             result["response_id"] = str(obj["id"])
+        if obj.get("model") and not result["model_name"]:
+            result["model_name"] = str(obj["model"])
         usage = obj.get("usage")
         if isinstance(usage, dict) and usage:
             merged = dict(result["usage"])
@@ -280,8 +293,10 @@ def parse_chat_payload(raw: bytes, content_type: str = "") -> dict[str, Any]:
 # ------------------------------------------------------- chat -> Anthropic
 
 def chat_to_anthropic(model: str, parsed: dict[str, Any],
-                      max_tokens: int = 1024) -> dict[str, Any]:
+                      max_tokens: int = 1024,
+                      alias_map: dict[str, str] | None = None) -> dict[str, Any]:
     """Convierte el parseado chat a mensaje Anthropic (mismo patron que responses)."""
+    alias_map = alias_map or {}
     text = str(parsed.get("text") or "")
     calls = parsed.get("tool_calls") or []
     content: list[dict[str, Any]] = []
@@ -290,7 +305,9 @@ def chat_to_anthropic(model: str, parsed: dict[str, Any],
     for c in calls:
         name = str(c.get("name") or "")
         args = c.get("arguments") if isinstance(c.get("arguments"), dict) else {}
-        if name in PLACEHOLDER_CLIENT_NAMES:  # read->Read, shell->Bash (P2d)
+        if name in alias_map:  # tool del cliente ocultado: restaura su nombre
+            name = alias_map[name]
+        elif name in PLACEHOLDER_CLIENT_NAMES:  # read->Read, shell->Bash (P2d)
             args = normalize_placeholder_args(name, args)
             name = PLACEHOLDER_CLIENT_NAMES[name]
         content.append({"type": "tool_use", "id": str(c.get("id") or ""),

@@ -27,7 +27,7 @@ from typing import Any
 
 from freya_wire import (
     conversation_scope,
-    zen_model_for_request,
+    resolve_zen_model,
 )
 from freya_tools import (
     anthropic_to_responses_tools,
@@ -174,11 +174,11 @@ def anthropic_messages_to_responses_input(messages: list[dict[str, Any]]) -> lis
     return items
 
 
-def anthropic_to_responses_body(body: dict) -> tuple[dict, str]:
-    """Construye el body Responses + scope. Devuelve (responses_body, scope)."""
+def anthropic_to_responses_body(body: dict) -> tuple[dict, str, dict[str, str]]:
+    """Body Responses + scope + mapa alias->nombre original (para respuestas)."""
     hoist_system_messages(body)
     scope = conversation_scope(body)
-    zen_model = zen_model_for_request(body.get("model"))
+    zen_model = resolve_zen_model(body.get("model"))
     instructions = flatten_anthropic_system(body.get("system"))
     messages = body.get("messages") or []
     resp_input = anthropic_messages_to_responses_input(messages)
@@ -198,8 +198,8 @@ def anthropic_to_responses_body(body: dict) -> tuple[dict, str]:
         rbody["max_output_tokens"] = mt
     # Fingerprint v2 (estilo Responses): alias de colisiones, read/shell
     # verbatim, tool_choice auto y nota anti-placeholder en instructions.
-    apply_fingerprint_tools(rbody, style="flat")
-    return rbody, scope
+    amap = apply_fingerprint_tools(rbody, style="flat")
+    return rbody, scope, amap
 
 
 # ---------------------------------------------------------------- parse Zen SSE
@@ -250,7 +250,8 @@ def parse_responses_payload(raw: bytes, content_type: str = "") -> dict[str, Any
     tool_calls preserva call_id del wire para el round-trip exacto (FASE 4/5).
     """
     if not raw:
-        return {"text": "", "tool_calls": [], "usage": {}, "response_id": ""}
+        return {"text": "", "tool_calls": [], "usage": {}, "response_id": "",
+                "saw_done": False}
     # JSON directo (error o respuesta completa sin SSE)
     stripped = raw.strip()[:1]
     if stripped in (b"{", b"["):
@@ -260,13 +261,13 @@ def parse_responses_payload(raw: bytes, content_type: str = "") -> dict[str, Any
             obj = None
         if isinstance(obj, dict) and obj.get("type") == "error" and "error" in obj:
             return {"text": "", "tool_calls": [], "usage": {}, "response_id": "",
-                    "error": obj, "error_status": None}
+                    "saw_done": False, "error": obj, "error_status": None}
         if isinstance(obj, dict) and ("output" in obj or "output_text" in obj):
             return _from_completed_response(obj)
         # Si parece JSON pero no es Responses, devuelve vacio (el llamante decide)
         if isinstance(obj, dict):
             return {"text": "", "tool_calls": [], "usage": {}, "response_id": "",
-                    "unknown_json": obj}
+                    "saw_done": False, "unknown_json": obj}
     # SSE
     events = _split_sse(raw)
     text_deltas: list[str] = []
@@ -337,6 +338,7 @@ def parse_responses_payload(raw: bytes, content_type: str = "") -> dict[str, Any
         if "_stream_error" in completed_obj:
             return {"text": "".join(text_deltas), "tool_calls": done_calls,
                     "usage": usage, "response_id": response_id,
+                    "saw_done": False,
                     "error": completed_obj["_stream_error"], "error_status": None}
         parsed = _from_completed_response(completed_obj)
         # Fusiona deltas si el completed no trae texto pero los deltas si
@@ -363,6 +365,7 @@ def parse_responses_payload(raw: bytes, content_type: str = "") -> dict[str, Any
         "tool_calls": _normalize_done_calls(done_calls),
         "usage": usage,
         "response_id": response_id,
+        "saw_done": False,
     }
 
 
@@ -416,7 +419,8 @@ def _from_completed_response(resp: dict) -> dict[str, Any]:
     usage = resp.get("usage") if isinstance(resp.get("usage"), dict) else {}
     rid = str(resp.get("id", "") or "")
     return {"text": "".join(texts), "tool_calls": calls, "usage": usage,
-            "response_id": rid}
+            "response_id": rid, "saw_done": True,
+            "model_name": str(resp.get("model", "") or "")}
 
 
 def estimate_tokens(text: str) -> int:
@@ -424,10 +428,12 @@ def estimate_tokens(text: str) -> int:
 
 
 def responses_to_anthropic(model: str, parsed: dict[str, Any],
-                           max_tokens: int = 1024) -> dict[str, Any]:
+                           max_tokens: int = 1024,
+                           alias_map: dict[str, str] | None = None) -> dict[str, Any]:
     """Convierte el parseado Responses a mensaje Anthropic."""
     import itertools as _it
     import time as _time
+    alias_map = alias_map or {}
     text = parsed.get("text", "") or ""
     calls = parsed.get("tool_calls") or []
     content: list[dict[str, Any]] = []
@@ -436,7 +442,9 @@ def responses_to_anthropic(model: str, parsed: dict[str, Any],
     for c in calls:
         name = str(c.get("name"))
         args = c.get("arguments") if isinstance(c.get("arguments"), dict) else {}
-        if name in PLACEHOLDER_CLIENT_NAMES:  # read->Read, shell->Bash (P2d)
+        if name in alias_map:  # tool del cliente ocultado: restaura su nombre
+            name = alias_map[name]
+        elif name in PLACEHOLDER_CLIENT_NAMES:  # read->Read, shell->Bash (P2d)
             args = normalize_placeholder_args(name, args)
             name = PLACEHOLDER_CLIENT_NAMES[name]
         content.append({"type": "tool_use", "id": str(c.get("id")),

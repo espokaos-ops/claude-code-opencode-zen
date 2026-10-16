@@ -21,7 +21,8 @@ class ChatConversionCase(unittest.TestCase):
                            "input_schema": {"type": "object"}}]}
 
     def test_body_chat_shape_with_fingerprint(self):
-        cbody, scope = zen_chat.anthropic_to_chat_body(self.cc_body())
+        cbody, scope, amap = zen_chat.anthropic_to_chat_body(self.cc_body())
+        self.assertEqual(amap, {})
         self.assertTrue(scope)
         self.assertTrue(cbody["stream"])
         self.assertEqual(cbody["max_tokens"], 128)
@@ -111,6 +112,43 @@ class ChatConversionCase(unittest.TestCase):
         self.assertEqual(parsed["text"], "ok")
         self.assertEqual(parsed["tool_calls"][0]["name"], "shell")
         self.assertEqual(parsed["tool_calls"][0]["arguments"], {"command": "ls"})
+
+    def test_image_block_becomes_visible_note(self):
+        body = self.cc_body(messages=[{"role": "user", "content": [
+            {"type": "image", "source": {"type": "base64", "data": "aGk="}},
+            {"type": "text", "text": "que ves?"}]}])
+        cbody, _scope, _amap = zen_chat.anthropic_to_chat_body(body)
+        user = [m for m in cbody["messages"] if m["role"] == "user"][-1]
+        self.assertIn("image omitted", user["content"])
+        self.assertIn("que ves?", user["content"])
+
+    def test_image_inside_tool_result_becomes_note(self):
+        body = self.cc_body(messages=[
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "tu_1", "content": [
+                    {"type": "image", "source": {"type": "base64", "data": "aGk="}}]}]}])
+        cbody, _scope, _amap = zen_chat.anthropic_to_chat_body(body)
+        tool = next(m for m in cbody["messages"] if m["role"] == "tool")
+        self.assertIn("image omitted", tool["content"])
+
+    def test_model_name_captured_from_stream(self):
+        sse = ('data: {"id":"c1","model":"beam-free","choices":[{"index":0,'
+               '"delta":{"content":"ok"},"finish_reason":"stop"}]}\n\n'
+               "data: [DONE]\n\n").encode()
+        parsed = zen_chat.parse_chat_payload(sse, "text/event-stream")
+        self.assertEqual(parsed["model_name"], "beam-free")
+        self.assertTrue(parsed["saw_done"])
+
+    def test_alias_restored_in_conversion(self):
+        parsed = {"text": "", "tool_calls": [
+            {"id": "c1", "name": "read_client",
+             "arguments": {"pattern": "x"}}],
+            "usage": {}, "finish_reason": "tool_calls"}
+        msg = zen_chat.chat_to_anthropic("beam-free", parsed,
+                                         alias_map={"read_client": "read"})
+        tool = msg["content"][0]
+        self.assertEqual(tool["name"], "read")
+        self.assertEqual(tool["input"], {"pattern": "x"})
 
 
 if __name__ == "__main__":

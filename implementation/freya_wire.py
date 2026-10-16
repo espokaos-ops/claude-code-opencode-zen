@@ -55,11 +55,12 @@ OPENCODE_ZEN_RESPONSES_PATH = "/responses"
 ZEN_MODEL_DEFAULT = "muse-spark-1.3-contributor-free"
 
 # Catalogo free vigente al 2026-10-16 (sonda P1: GET /inference/v1/models,
-# 88 modelos / 12 free; salieron big-pickle y nemotron-3-ultra-free, entro
-# jev-1.13-free). El catalogo vivo se consulta en runtime via
+# 88 modelos / 13 free; salio nemotron-3-ultra-free, entraron big-pickle
+# (Fase 4) y jev-1.13-free). El catalogo vivo se consulta en runtime via
 # ``zen_fingerprint.fetch_models``; este set es el fallback sin red.
 OPENCODE_FREE_MODELS = frozenset({
     "beam-free",
+    "big-pickle",
     "ll-alpha-free",
     "mimo-v2.6-flash-free",
     "muse-spark-1.2-contributor-free",
@@ -72,6 +73,10 @@ OPENCODE_FREE_MODELS = frozenset({
     "glm-5.3-flash-free",
     "space-bunny-free",
 })
+
+# Alias que el gateway acepta y sirve en GET /v1/models para que el selector
+# de Claude Code (filtra ids con "claude"/"anthropic") muestre los free.
+MODEL_ALIAS_PREFIX = "claude-free-"
 
 _id_counter = 0
 _id_counter_ms = 0
@@ -124,15 +129,39 @@ def is_muse_spark(model: str | None) -> bool:
     return normalize_model_id(model).startswith("muse-spark")
 
 
+def model_alias(model: str | None) -> str:
+    """Id del selector para un free: ``claude-free-<slug>``."""
+    return MODEL_ALIAS_PREFIX + str(model or "").strip()
+
+
+def resolve_zen_model(requested: str | None) -> str:
+    """Modelo free verificado al que se enruta el request (estricto).
+
+    Acepta el slug pelado (``beam-free``), con prefijo provider
+    (``opencode/beam-free``) o alias del selector (``claude-free-beam-free``).
+    Un id desconocido lanza ValueError: jamas se sustituye en silencio por
+    otro modelo (un fallback oculto haria responder a un modelo distinto del
+    solicitado).
+    """
+    raw = str(requested or "").strip()
+    if not raw:
+        raise ValueError(
+            "missing model: set ANTHROPIC_MODEL to a free OpenCode Zen id "
+            f"(available: {', '.join(sorted(OPENCODE_FREE_MODELS))})")
+    bare = raw.rsplit("/", 1)[-1].strip().lower()
+    if bare.startswith(MODEL_ALIAS_PREFIX):
+        bare = bare[len(MODEL_ALIAS_PREFIX):]
+    if bare in OPENCODE_FREE_MODELS:
+        return bare
+    raise ValueError(
+        f"unknown/unsupported model '{raw}': the gateway only routes the "
+        f"verified free models (available: {', '.join(sorted(OPENCODE_FREE_MODELS))})"
+        "; set ANTHROPIC_MODEL to one of them")
+
+
 def zen_model_for_request(requested: str | None) -> str:
-    """Modelo que viaja a Zen: el pedido si es free conocido, si no el default."""
-    norm = normalize_model_id(requested)
-    if norm in OPENCODE_FREE_MODELS:
-        # Devuelve el slug normalizado (Zen lo espera sin prefijo provider/).
-        # Preserva el original si ya era slug (caso comun).
-        bare = str(requested or "").strip().rsplit("/", 1)[-1].strip()
-        return bare or ZEN_MODEL_DEFAULT
-    return ZEN_MODEL_DEFAULT
+    """Compat: alias estricto de ``resolve_zen_model`` (lanza si no es free)."""
+    return resolve_zen_model(requested)
 
 
 def conversation_scope(body: dict) -> str:
